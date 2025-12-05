@@ -1,3 +1,26 @@
+/* @tailwind base;
+@tailwind components;
+@tailwind utilities; */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-50 text-gray-900;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-white/80 backdrop-blur-lg border border-white/20 shadow-xl;
+  }
+  
+  .gradient-bg {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  }
+  
+  .skill-bar {
+    transition: width 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+}

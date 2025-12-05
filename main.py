@@ -21,18 +21,24 @@ from datetime import datetime
 import nltk
 from dotenv import load_dotenv
 
-# Load environment variables
+# --- 1. SETUP & CONFIGURATION ---
 load_dotenv()
 
-# Initialize Groq client
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+# Check for API Key
+api_key = os.getenv("GROQ_API_KEY")
+if not api_key:
+    raise ValueError("GROQ_API_KEY not found in environment variables!")
 
+client = Groq(api_key=api_key)
+
+# NLTK Setup
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
     nltk.download('stopwords')
 
+# Load ML Models
 try:
     with open('tfidf_advanced.pkl', 'rb') as f:
         tfidf = pickle.load(f)
@@ -42,8 +48,7 @@ try:
         le = pickle.load(f)
     category_classes = le.classes_
 except FileNotFoundError:
-    print("Error: Model files not found. Please ensure .pkl files are in the directory.")
-    # Create dummy objects for testing if files are missing (REMOVE IN PRODUCTION)
+    print("⚠️ Error: Model files not found. Using Dummy models for testing.")
     class Dummy: 
         def predict(self, x): return [0]
         def predict_proba(self, x): return [[0.99]]
@@ -56,9 +61,35 @@ except FileNotFoundError:
     model = Dummy()
     le = DummyLE()
 
+# --- 2. PRIVACY & SECURITY LAYER (NEW) ---
+class PIIScrubber:
+    """
+    Handles the redaction of sensitive data before it is sent to the AI.
+    This ensures user privacy by keeping PII local.
+    """
+    @staticmethod
+    def scrub(text):
+        # 1. Redact Email Addresses
+        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+        text = re.sub(email_pattern, "[EMAIL_REDACTED]", text)
+
+        # 2. Redact Phone Numbers (US/Intl formats)
+        phone_pattern = r'(\+\d{1,3}[-.]?)?\(?\d{3}\)?[-.]?\d{3}[-.]?\d{4}'
+        text = re.sub(phone_pattern, "[PHONE_REDACTED]", text)
+
+        # 3. Redact Specific Social Links (LinkedIn/Github profiles often contain names)
+        url_pattern = r'https?://(www\.)?(linkedin|github)\.com/[\w-]+'
+        text = re.sub(url_pattern, "[PROFILE_URL_REDACTED]", text)
+
+        return text
+
+# Initialize Scrubber
+pii_scrubber = PIIScrubber()
+
+# --- 3. HELPER FUNCTIONS ---
 
 def cleanResume(txt):
-    """Enhanced resume cleaning with better text processing"""
+    """Enhanced resume cleaning for ML classification"""
     cleanText = re.sub('http\S+\s', ' ', txt)
     cleanText = re.sub('RT|cc', ' ', cleanText)
     cleanText = re.sub('#\S+\s', ' ', cleanText)
@@ -68,34 +99,13 @@ def cleanResume(txt):
     cleanText = re.sub('\s+', ' ', cleanText)
     return cleanText.strip()
 
-def calculate_ats_score(resume_text):
-    """Calculate ATS compatibility score (Rule-based)"""
-    score = 100
-    issues = []
-    if not re.search(r'[\w\.-]+@[\w\.-]+\.\w+', resume_text):
-        score -= 10
-        issues.append("Missing email address")
-
-    if not re.search(r'\+?\d[\d\s\-\(\)]{8,}\d', resume_text):
-        score -= 10
-        issues.append("Missing phone number")
-    
-    word_count = len(resume_text.split())
-    if word_count < 200:
-        score -= 15
-        issues.append("Resume too short")
-    elif word_count > 1500:
-        score -= 10
-        issues.append("Resume too long")
-    
-    return max(0, score), issues
 def advanced_skill_gap_chain(resume_text, predicted_category):
     """
-    CHAIN LOGIC: 
-    1. Receives the Job Category from the Pickle Model.
-    2. Uses AI to dynamically extract skills and perform gap analysis based on that specific category.
-    3. Replaces hardcoded lists with LLM intelligence.
+    Performs AI analysis on ANONYMIZED text.
     """
+    
+    # [PRIVACY STEP] Scrub PII before sending to AI
+    anonymized_text = pii_scrubber.scrub(resume_text)
     
     prompt = f"""
     You are an expert technical recruiter and career coach. 
@@ -108,11 +118,14 @@ def advanced_skill_gap_chain(resume_text, predicted_category):
     
     1. Extract all Technical Skills found in the text.
     2. Extract all Soft Skills found in the text.
-    3. Perform a Gap Analysis: Compare the user's skills against the CURRENT 2024/2025 market requirements for a '{predicted_category}'.
+    3. Perform a Gap Analysis: Compare the user's skills against the CURRENT 2025 market requirements.
     4. Provide specific improvement suggestions.
 
+    IMPORTANT: The resume text has been anonymized (emails/phones removed). 
+    Focus only on skills and experience.
+
     RESUME TEXT:
-    {resume_text[:2500]}
+    {anonymized_text[:2500]}
 
     OUTPUT FORMAT (Strict JSON):
     {{
@@ -150,13 +163,22 @@ def advanced_skill_gap_chain(resume_text, predicted_category):
         }
 
 def generate_cover_letter(resume_text, job_title, company_name):
-    """AI-generated personalized cover letter"""
+    """AI-generated personalized cover letter with PRIVACY PROTECTION"""
+    
+    # [PRIVACY STEP] Scrub PII
+    anonymized_text = pii_scrubber.scrub(resume_text)
+
     prompt = f"""
-    Based on this resume, generate a professional cover letter for the position of {job_title} at {company_name}.
-    Keep it concise (250 words) and professional.
+    Based on this ANONYMIZED resume, generate a professional cover letter for the position of {job_title} at {company_name}.
+    
+    PRIVACY INSTRUCTIONS:
+    1. The resume text has [REDACTED] placeholders for email and phone.
+    2. Do NOT invent a name or contact info. 
+    3. Use placeholders like "[Candidate Name]", "[Your Email]", and "[Your Phone]" in the letter header and signature.
+    4. Keep it concise (250 words).
     
     Resume:
-    {resume_text[:1500]}
+    {anonymized_text[:1500]}
     """
     try:
         chat_completion = client.chat.completions.create(
@@ -166,6 +188,7 @@ def generate_cover_letter(resume_text, job_title, company_name):
         return chat_completion.choices[0].message.content
     except Exception as e:
         return f"Error generating cover letter: {str(e)}"
+
 def search_jobs_alternative_sites(keywords, location="USA"):
     """Opens browser tabs for job search (Stable Version)"""
     options = uc.ChromeOptions()
@@ -174,18 +197,24 @@ def search_jobs_alternative_sites(keywords, location="USA"):
     
     driver = None
     try:
-        driver = uc.Chrome(options=options)
+        driver = uc.Chrome(options=options, version_main=142) # Adjust version if needed
+        
         sites = [
             f"https://www.linkedin.com/jobs/search/?keywords={keywords}&location={location}",
             f"https://www.indeed.com/jobs?q={keywords.replace(' ', '+')}&l={location}",
             f"https://www.glassdoor.com/Job/jobs.htm?sc.keyword={keywords.replace(' ', '+')}"
         ]
+        
+        # Navigate to the first site
         driver.get(sites[0])
+        
+        # Open the rest in new tabs
         for i in range(1, len(sites)):
             driver.execute_script("window.open('about:blank', '_blank');")
             time.sleep(1)
             driver.switch_to.window(driver.window_handles[-1])
             driver.get(sites[i])
+            
         time.sleep(180)
     except Exception as e:
         print(f"Selenium Error: {e}")
@@ -193,10 +222,13 @@ def search_jobs_alternative_sites(keywords, location="USA"):
         if driver:
             try: driver.quit()
             except: pass
+
+# --- 4. API ENDPOINTS ---
+
 app = FastAPI(
-    title="🚀 Advanced AI Resume Analyzer (Chain-Enhanced)",
-    description="Resume analysis using Hybrid ML (Pickle) + LLM Chain",
-    version="3.0.0"
+    title="🚀 Advanced AI Resume Analyzer (Privacy Enhanced)",
+    description="Resume analysis using Hybrid ML + LLM Chain with PII Redaction",
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -214,17 +246,14 @@ class CoverLetterRequest(BaseModel):
 
 @app.post("/comprehensive_analysis", tags=["Advanced Analysis"])
 async def comprehensive_analysis(resume_file: UploadFile = File(...)):
-    """
-    THE ADVANCED PIPELINE:
-    1. PDF -> Text
-    2. Text -> TFIDF -> Pickle Model -> Predicted Category (Offline ML)
-    3. Category + Text -> Groq Chain -> Dynamic Skills & Gap Analysis (GenAI)
-    """
     try:
+        # 1. Read File
         resume_bytes = await resume_file.read()
         pdf_file = BytesIO(resume_bytes)
         pdf_reader = PyPDF2.PdfReader(pdf_file)
         resume_text = "".join([page.extract_text() for page in pdf_reader.pages])
+        
+        # 2. Local Classification (Uses Cleaned Text, safe locally)
         cleaned_resume = cleanResume(resume_text)
         vectorized_text = tfidf.transform([cleaned_resume])
         predicted_category_index = model.predict(vectorized_text)[0]
@@ -232,7 +261,12 @@ async def comprehensive_analysis(resume_file: UploadFile = File(...)):
         confidence = model.predict_proba(vectorized_text)[0][predicted_category_index]
         
         print(f"🤖 Model Prediction: {predicted_category_name} ({confidence:.2f})")
-        ats_score, ats_issues = calculate_ats_score(resume_text)
+        
+        # 3. Local ATS Check (Uses Raw Text to check for missing emails, safe locally)
+        # ats_score, ats_issues = calculate_ats_score(resume_text)
+        
+        # 4. AI Analysis (Uses SCRUBBED text to protect privacy)
+        # The scrubbing happens inside this function now
         ai_insights = advanced_skill_gap_chain(resume_text, predicted_category_name)
         
         return {
@@ -243,10 +277,10 @@ async def comprehensive_analysis(resume_file: UploadFile = File(...)):
                 "confidence_score": f"{confidence * 100:.2f}%",
                 "method": "Hybrid (TF-IDF + Random Forest)"
             },
-            "ats_metrics": {
-                "score": ats_score,
-                "issues": ats_issues
-            },
+            # "ats_metrics": {
+            #     "score": ats_score,
+            #     "issues": ats_issues
+            # },
             "dynamic_analysis": {
                 "skills_detected": ai_insights.get("extracted_skills"),
                 "gap_analysis": ai_insights.get("gap_analysis"),
@@ -262,7 +296,6 @@ async def search_jobs_multi(
     resume_file: UploadFile = File(...),
     location: str = "USA"
 ):
-    """Analyzes resume via ML and opens job searches automatically"""
     try:
         resume_bytes = await resume_file.read()
         pdf_reader = PyPDF2.PdfReader(BytesIO(resume_bytes))
@@ -278,9 +311,10 @@ async def search_jobs_multi(
 
 @app.post("/generate_cover_letter", tags=["Tools"])
 async def api_cover_letter(req: CoverLetterRequest):
+    # The privacy scrubbing happens inside this function
     res = generate_cover_letter(req.resume_text, req.job_title, req.company_name)
     return {"success": True, "cover_letter": res}
 
 if __name__ == "__main__":
-    print("🚀 ADVANCED AI RESUME ANALYZER STARTING...")
+    print("🚀 ADVANCED AI RESUME ANALYZER (PRIVACY ENABLED) STARTING...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
