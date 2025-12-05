@@ -106,11 +106,7 @@ const AnalysisResults = ({ data }) => {
             </span>
           </div>
         </div>
-        
-        {/* Confidence Meter */}
-        <div className="flex items-center gap-4">
   
-        </div>
       </div>
 
       {/* Skills Analysis Grid */}
