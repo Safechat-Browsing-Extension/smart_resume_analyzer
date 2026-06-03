@@ -5,7 +5,9 @@ from fastapi import FastAPI, Request, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
-import undetected_chromedriver as uc
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -25,6 +27,7 @@ import statistics
 import threading
 import requests
 from bs4 import BeautifulSoup
+import webbrowser
 
 # --- 1. SETUP & CONFIGURATION ---
 load_dotenv()
@@ -129,15 +132,13 @@ def compute_resume_score(resume_text: str, ai_insights: dict) -> dict:
 
 
 # ============================================================
-# --- 4A. REAL-TIME SALARY SCRAPER (Replaces AI salary) ---
+# --- 4A. REAL-TIME SALARY SCRAPER ---
 # ============================================================
 
 class RealTimeSalaryScraper:
     """
     Scrapes real salary data from LinkedIn, Indeed, and Glassdoor.
-    Parses salary ranges mentioned in job postings and aggregates them
-    into entry/mid/senior level estimates based on the job title keywords.
-    No AI involved — pure live market data.
+    Uses standard Selenium WebDriver manager configurations to parse platforms securely.
     """
 
     HEADERS = {
@@ -149,7 +150,6 @@ class RealTimeSalaryScraper:
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    # Regex to capture salary patterns like "$80,000", "$80K", "$80k-$120k", "80000-120000"
     SALARY_PATTERN = re.compile(
         r'\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s?[kK]?\s?'
         r'(?:[-–to]+\s?\$?\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s?[kK]?)?'
@@ -159,14 +159,12 @@ class RealTimeSalaryScraper:
 
     @staticmethod
     def _parse_value(raw: str, is_k: bool) -> float:
-        """Converts a raw number string to float, handling K suffix."""
         val = float(raw.replace(',', ''))
         if is_k or val < 1000:
             val *= 1000
         return val
 
     def _extract_salaries_from_text(self, text: str) -> List[float]:
-        """Finds all salary numbers in a block of text."""
         salaries = []
         for match in self.SALARY_PATTERN.finditer(text):
             raw1 = match.group(1)
@@ -176,7 +174,7 @@ class RealTimeSalaryScraper:
 
             if raw1:
                 v1 = self._parse_value(raw1, is_k)
-                if 20000 <= v1 <= 500000:  # Sanity range
+                if 20000 <= v1 <= 500000:
                     salaries.append(v1)
             if raw2:
                 v2 = self._parse_value(raw2, is_k)
@@ -185,7 +183,6 @@ class RealTimeSalaryScraper:
         return salaries
 
     def _scrape_indeed(self, role: str, location: str) -> dict:
-        """Scrapes Indeed salary data using their public salary page."""
         role_slug = role.replace(' ', '-').lower()
         url = f"https://www.indeed.com/career/{role_slug}/salaries"
         result = {"source": "Indeed", "salaries": [], "raw_text": ""}
@@ -201,7 +198,6 @@ class RealTimeSalaryScraper:
         return result
 
     def _scrape_glassdoor(self, role: str, location: str) -> dict:
-        """Scrapes Glassdoor salary data using their public salary page."""
         role_slug = role.replace(' ', '-').lower()
         url = f"https://www.glassdoor.com/Salaries/{role_slug}-salary-SRCH_KO0,{len(role_slug)}.htm"
         result = {"source": "Glassdoor", "salaries": [], "raw_text": ""}
@@ -217,23 +213,14 @@ class RealTimeSalaryScraper:
         return result
 
     def _scrape_linkedin_jobs(self, role: str, location: str) -> dict:
-        """
-        Scrapes LinkedIn job postings (public search, no login needed).
-        Extracts salary info from job descriptions that include pay ranges.
-        """
         role_encoded = requests.utils.quote(role)
         location_encoded = requests.utils.quote(location)
-        url = (
-            f"https://www.linkedin.com/jobs/search/"
-            f"?keywords={role_encoded}&location={location_encoded}&f_SB2=1"  # f_SB2=1 filters for jobs with salary info
-        )
+        url = f"https://www.linkedin.com/jobs/search/?keywords={role_encoded}&location={location_encoded}&f_SB2=1"
         result = {"source": "LinkedIn", "salaries": [], "job_titles": [], "raw_text": ""}
         try:
             resp = requests.get(url, headers=self.HEADERS, timeout=10)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
-
-                # Extract job cards
                 job_cards = soup.find_all('div', class_=re.compile(r'base-card'))
                 for card in job_cards[:20]:
                     card_text = card.get_text(separator=' ')
@@ -241,8 +228,6 @@ class RealTimeSalaryScraper:
                     title_tag = card.find('h3')
                     if title_tag:
                         result["job_titles"].append(title_tag.get_text(strip=True))
-
-                # Also scan full page text
                 full_text = soup.get_text(separator=' ')
                 result["salaries"].extend(self._extract_salaries_from_text(full_text))
                 result["raw_text"] = full_text[:500]
@@ -252,22 +237,25 @@ class RealTimeSalaryScraper:
 
     def _scrape_with_selenium(self, role: str, location: str) -> dict:
         """
-        Fallback: Uses Selenium (undetected Chrome) to scrape salary pages
-        that block simple requests. Used when requests-based scraping fails
-        or returns no salary data.
+        Fallback: Employs standard Selenium with Webdriver Manager to parse script-heavy 
+        salary listings securely under headless infrastructure.
         """
         result = {"source": "Selenium-Fallback", "salaries": [], "pages_scraped": []}
-        options = uc.ChromeOptions()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
+        
+        chrome_options = webdriver.ChromeOptions()
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        
         driver = None
         try:
-            driver = uc.Chrome(options=options)
+            driver = webdriver.Chrome(
+                service=Service(ChromeDriverManager().install()),
+                options=chrome_options
+            )
             role_encoded = requests.utils.quote(role)
 
-            # Scrape Indeed salary page
+            # Scrape Indeed
             indeed_url = f"https://www.indeed.com/career/{role.replace(' ', '-').lower()}/salaries"
             driver.get(indeed_url)
             time.sleep(3)
@@ -276,11 +264,8 @@ class RealTimeSalaryScraper:
             result["salaries"].extend(found)
             result["pages_scraped"].append({"url": indeed_url, "salaries_found": len(found)})
 
-            # Scrape LinkedIn salary page
-            linkedin_url = (
-                f"https://www.linkedin.com/salary/search"
-                f"?keywords={role_encoded}&location={requests.utils.quote(location)}"
-            )
+            # Scrape LinkedIn
+            linkedin_url = f"https://www.linkedin.com/salary/search?keywords={role_encoded}&location={requests.utils.quote(location)}"
             driver.get(linkedin_url)
             time.sleep(3)
             text = driver.find_element(By.TAG_NAME, 'body').text
@@ -299,21 +284,7 @@ class RealTimeSalaryScraper:
         return result
 
     def _build_salary_tiers(self, all_salaries: List[float], role: str) -> dict:
-        """
-        Given a flat list of salary numbers scraped from job postings,
-        segments them into entry/mid/senior tiers using percentile splits.
-        
-        Strategy:
-          - Sort all salaries ascending
-          - Bottom 33% → entry level
-          - Middle 33% → mid level
-          - Top 33% → senior level
-        
-        Falls back to role-category heuristics if too few data points.
-        """
         if len(all_salaries) < 6:
-            # Not enough real data — use role-based conservative heuristics
-            # These are conservative floor estimates, not AI guesses
             role_lower = role.lower()
             if any(k in role_lower for k in ['senior', 'lead', 'principal', 'staff', 'director']):
                 base = 120000
@@ -322,7 +293,7 @@ class RealTimeSalaryScraper:
             elif any(k in role_lower for k in ['manager', 'architect', 'head of', 'vp']):
                 base = 140000
             else:
-                base = 85000  # Mid-level default
+                base = 85000
 
             return {
                 "data_source": "heuristic_fallback",
@@ -358,15 +329,9 @@ class RealTimeSalaryScraper:
         }
 
     def estimate(self, role: str, location: str = "USA") -> dict:
-        """
-        Main entry point. Runs scrapers in parallel threads, collects all
-        salary data points, deduplicates, and builds tiered estimates.
-        """
         results_by_source = {}
         all_salaries = []
-        errors = []
 
-        # --- Run lightweight requests-based scrapers in parallel ---
         scrapers = {
             "indeed":    lambda: self._scrape_indeed(role, location),
             "glassdoor": lambda: self._scrape_glassdoor(role, location),
@@ -390,7 +355,6 @@ class RealTimeSalaryScraper:
         for t in threads.values():
             t.join(timeout=15)
 
-        # Aggregate results
         for name, res in thread_results.items():
             source_salaries = res.get("salaries", [])
             all_salaries.extend(source_salaries)
@@ -399,7 +363,6 @@ class RealTimeSalaryScraper:
                 "error": res.get("error"),
             }
 
-        # Remove duplicates and outliers
         all_salaries = list(set(all_salaries))
         if len(all_salaries) > 4:
             q1 = statistics.quantiles(all_salaries, n=4)[0]
@@ -407,7 +370,6 @@ class RealTimeSalaryScraper:
             iqr = q3 - q1
             all_salaries = [s for s in all_salaries if (q1 - 1.5 * iqr) <= s <= (q3 + 1.5 * iqr)]
 
-        # If still not enough data, use Selenium fallback
         if len(all_salaries) < 6:
             selenium_result = self._scrape_with_selenium(role, location)
             selenium_salaries = selenium_result.get("salaries", [])
@@ -433,10 +395,6 @@ class RealTimeSalaryScraper:
 
     @staticmethod
     def _estimate_demand(thread_results: dict) -> str:
-        """
-        Estimates market demand based on number of job postings found.
-        LinkedIn job title counts serve as a proxy for demand.
-        """
         linkedin_res = thread_results.get("linkedin", {})
         job_count = len(linkedin_res.get("job_titles", []))
         if job_count >= 15:
@@ -449,13 +407,11 @@ class RealTimeSalaryScraper:
             return "Low (or niche role)"
 
 
-
-
 # Instantiate once at startup
 salary_scraper = RealTimeSalaryScraper()
 
 
-# --- 4C. REMAINING AI CHAINS (unchanged) ---
+# --- 4C. REMAINING AI CHAINS ---
 def advanced_skill_gap_chain(resume_text, predicted_category):
     anonymized_text = pii_scrubber.scrub(resume_text)
     prompt = f"""
@@ -634,28 +590,44 @@ def generate_cover_letter(resume_text, job_title, company_name):
 
 
 def search_jobs_alternative_sites(keywords, location="USA"):
-    options = uc.ChromeOptions()
-    options.add_argument("--start-maximized")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
+    """
+    Opens target platforms via visible standard Selenium browser tabs to let the user review openings.
+    """
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    
+    keywords_encoded = requests.utils.quote(keywords)
+    location_encoded = requests.utils.quote(location)
+    
+    sites = [
+        f"https://www.linkedin.com/jobs/search/?keywords={keywords_encoded}&location={location_encoded}",
+        f"https://www.indeed.com/jobs?q={keywords_encoded}&l={location_encoded}",
+        f"https://www.glassdoor.com/Job/jobs.htm?sc.keyword={keywords_encoded}"
+    ]
+    
     driver = None
     try:
-        driver = uc.Chrome(options=options)
-        sites = [
-            f"https://www.linkedin.com/jobs/search/?keywords={keywords}&location={location}",
-            f"https://www.indeed.com/jobs?q={keywords.replace(' ', '+')}&l={location}",
-            f"https://www.glassdoor.com/Job/jobs.htm?sc.keyword={keywords.replace(' ', '+')}"
-        ]
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=chrome_options
+        )
         driver.get(sites[0])
         for i in range(1, len(sites)):
             driver.execute_script("window.open('about:blank', '_blank');")
             time.sleep(1)
             driver.switch_to.window(driver.window_handles[-1])
             driver.get(sites[i])
-        time.sleep(180)
+        time.sleep(180)  # Keep tabs open for user visibility
+        
     except Exception as e:
-        print(f"Selenium Error: {e}")
+        print(f"Selenium Error: {e}. Falling back to standard system browser execution...")
+        for url in sites:
+            webbrowser.open_new_tab(url)
+            time.sleep(0.5)
+            
     finally:
         if driver:
             try:
@@ -693,8 +665,6 @@ class CoverLetterRequest(BaseModel):
 class SalaryRequest(BaseModel):
     predicted_category: str
     location: str = "USA"
-    # Note: `skills` field removed — real scraper uses role + location only.
-    # Keeping as optional for backward compatibility.
     skills: Optional[List[str]] = []
 
 class InterviewRequest(BaseModel):
@@ -706,7 +676,6 @@ class LinkedInRequest(BaseModel):
     resume_text: str
     predicted_category: str
     top_skills: List[str]
-
 
 class RoadmapRequest(BaseModel):
     resume_text: str
@@ -755,17 +724,8 @@ async def comprehensive_analysis(resume_file: UploadFile = File(...)):
 
 @app.post("/estimate_salary", tags=["Live Data Features"])
 async def api_salary_estimate(req: SalaryRequest):
-    """
-    Estimates salary ranges using LIVE scraped data from LinkedIn, Indeed,
-    and Glassdoor. No AI involved — data is sourced in real time.
-    
-    Returns tiered salary bands (entry/mid/senior) with median, min, max,
-    plus source breakdown showing how many data points came from each site.
-    """
     result = salary_scraper.estimate(req.predicted_category, req.location)
     return {"success": True, "salary_data": result}
-
-
 
 
 @app.post("/generate_interview_questions", tags=["AI Features"])
@@ -801,6 +761,8 @@ async def search_jobs_multi(resume_file: UploadFile = File(...), location: str =
         cleaned = cleanResume(resume_text)
         vec = tfidf.transform([cleaned])
         category = le.inverse_transform([model.predict(vec)[0]])[0]
+        
+        # Trigger background browser windows via standard Selenium thread execution
         search_jobs_alternative_sites(category, location)
         return {"success": True, "category": category, "status": "Browser Opened"}
     except Exception as e:
